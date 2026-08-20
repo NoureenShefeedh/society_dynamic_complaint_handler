@@ -1,5 +1,8 @@
 import multer from "multer";
 
+// Store the file in memory (as a buffer) rather than on disk — we
+// immediately forward it to Supabase Storage, so we don't need to
+// write it to the local filesystem first.
 const storage = multer.memoryStorage();
 
 function fileFilter(req, file, cb) {
