@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import pool from "./db/pool.js";
+import authRoutes from "./routes/authRoutes.js";
 
 dotenv.config();
 
@@ -21,8 +22,9 @@ app.get("/health", async (req, res) => {
   }
 });
 
+app.use("/api/auth", authRoutes);
+
 // Route modules will be mounted here as they're built:
-// app.use("/api/auth", authRoutes);
 // app.use("/api/complaints", complaintRoutes);
 // app.use("/api/notices", noticeRoutes);
 // app.use("/api/dashboard", dashboardRoutes);
