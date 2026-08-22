@@ -1,0 +1,23 @@
+# System Design Write-up
+
+## Complaint history model
+
+The central design decision in this system is that **`complaints.status` is not the source of truth — `complaint_history` is.** The complaints table holds a status field for fast filtering and display, but every meaningful event (creation, status change, priority override, staff assignment, resident confirmation, reopening) writes an append-only row to `complaint_history` with `actor_id`, `old_status`, `new_status`, a `priority_score_at_time` snapshot, and an optional note. Nothing in this table is ever updated or deleted.
+
+This matters for two reasons. First, it makes the full lifecycle reconstructable at any point — given a complaint, `SELECT * FROM complaint_history WHERE complaint_id = ? ORDER BY created_at` returns the complete story: who raised it, who touched it, what changed, and why, with nothing lost. Second, it lets "Resolved" mean something more than an admin's word for it. Marking a complaint Resolved requires a photo (enforced server-side, not just suggested in the UI) and does not close the loop — the resident sees a prompt to confirm or reopen. A reopen writes a new history row (`Resolved → Reopened`) on the _same_ complaint ID rather than creating a new ticket, so a dispute is visible as part of one continuous record rather than fragmenting into duplicate complaints. This closes a real gap in most complaint systems, where "resolved" only ever reflects the admin's claim, not whether the issue was actually fixed.
+
+## Priority and overdue detection
+
+Priority is not a static label an admin picks — it's a computed score, recalculated live on every admin request, from three inputs: a per-category severity weight (configurable in the `categories` table), how many days the complaint has been open (capped so it doesn't dominate indefinitely), and whether 3+ similar complaints landed in the same category within the last 14 days (a recurrence bonus). This score maps to Low/Medium/High/Critical for display, but the raw score — not the label — drives sort order, so two "High" complaints don't get treated as interchangeable.
+
+The initial component of that score comes from a small trained classifier (TF-IDF + Linear Regression, scikit-learn) run on the complaint's description text at creation time. This is what lets a complaint reading "gas leak smell, getting stronger" register as high-priority the moment it's submitted, rather than only becoming urgent after sitting open for days — a limitation of purely time-based or manually-assigned priority. The model was trained on ~270 labeled synthetic examples since no real historical complaint data existed; it's intentionally simple (a linear model over weighted n-grams) rather than a larger architecture, since a few hundred labeled examples don't justify anything heavier, and a linear model's behavior is easy to inspect and explain. Admins can still manually override any computed priority; the override is itself logged to history like any other change, so auto-scoring and human judgment aren't in conflict — the score is a strong default, not a constraint.
+
+Overdue detection reuses the same `days_open` calculation against a per-category `overdue_threshold_days` (e.g. Electrical: 2 days, Cosmetic: 10 days) rather than one global cutoff, since a burst pipe and a chipped tile don't share a reasonable SLA. Overdue complaints are excluded once Resolved and surfaced at the top of the admin board automatically, without a background job — the flag is derived at read time from `created_at` and the category threshold, so it's never stale.
+
+## Photo handling
+
+Photos are uploaded as multipart form data, held in memory (not written to local disk, since the server is stateless across deploys), and pushed directly to Supabase Storage in a public bucket, returning a permanent URL stored on the complaint row. Complaint photos and resolution photos live in separate folders within the same bucket (`complaints/` and `resolutions/`) so a resolved complaint carries both the original issue and proof of the fix, viewable side by side.
+
+## Notification flow
+
+Email (Nodemailer over Gmail SMTP) fires in two places: whenever an admin changes a complaint's status, and whenever a notice is posted with `is_important = true` (sent to every resident). Both calls are fire-and-forget with respect to the main request — if email delivery fails, it's logged and swallowed rather than rolling back the underlying status change or notice post, since a broken SMTP configuration should never block the actual state change from succeeding. This was a deliberate tradeoff: notifications are a courtesy layer on top of a system whose correctness doesn't depend on them.
