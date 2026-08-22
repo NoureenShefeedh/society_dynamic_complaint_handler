@@ -31,7 +31,7 @@ A complaint management platform for apartment societies. Residents raise and tra
 **Admin**
 
 - View all complaints, filter by status/category/date, on a Kanban-style board
-- Priority is computed automatically (not just picked) from a trained ML classifier on the complaint text, category severity, days open, and recurrence — see [system design doc](./SYSTEM_DESIGN.md) — with a manual override always available
+- Priority is computed automatically (not just picked) from a trained ML classifier on the complaint text, category severity, days open, and recurrence — see [system design doc](./SYSTEM_DESIGN.md)
 - Update status (Open → In Progress → Resolved), each change logged with timestamp, actor, and note
 - Resolving a complaint requires a photo as proof of work
 - Overdue complaints (past a configurable per-category threshold) surface automatically
@@ -43,6 +43,18 @@ A complaint management platform for apartment societies. Residents raise and tra
 **Both roles**
 
 - Email notification on complaint status change and on important notices
+
+---
+
+## Demo credentials
+
+For quick evaluation without creating an account:
+
+| Role  | Email             | Password     |
+| ----- | ----------------- | ------------ |
+| Admin | admin@example.com | adminPass123 |
+
+Residents can self-register via the Sign Up page on the live app — no demo account needed for that role.
 
 ---
 
