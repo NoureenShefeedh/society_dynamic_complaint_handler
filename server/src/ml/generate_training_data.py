@@ -35,6 +35,13 @@ HIGH_SEVERITY = [
     ("Water tank overflow is flooding the terrace and leaking down", 7),
     ("Children's play area has broken glass scattered around", 7),
     ("Lift cable is making a loud snapping noise during use", 9),
+    ("I got an electric shock touching the switchboard", 10),
+    ("Getting shocks from the switch board near the kitchen", 10),
+    ("My child got a mild shock from the wall socket", 10),
+    ("Electrocution risk from the exposed switch board wiring", 10),
+    ("Touching the metal railing gives an electric shock", 9),
+    ("Washing machine gives a shock when plugged in", 9),
+    ("Switch board sparked and gave me a shock", 10),
 ]
 
 MEDIUM_SEVERITY = [

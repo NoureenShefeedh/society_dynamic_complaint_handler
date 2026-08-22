@@ -2,6 +2,10 @@ import pool from "../db/pool.js";
 import { uploadPhoto } from "../utils/photoUpload.js";
 import { computePriorityScore, isOverdue, calculateDaysOpen } from "../utils/priorityEngine.js";
 import { classifySeverity } from "../utils/severityClassifier.js";
+import { sendEmail } from "../utils/email.js";
+import crypto from "crypto";
+
+const RECURRENCE_LINK_THRESHOLD = 3;
 
 // POST /api/complaints
 // Resident creates a complaint, optionally with a photo.
@@ -57,11 +61,35 @@ export async function createComplaint(req, res) {
       initialSeverityScore,
     });
 
+    // If this is the 3rd+ similar complaint recently, link it and any
+    // other unlinked recent similar complaints under a shared group so
+    // the admin sees them as one recurring issue, not separate tickets.
+    let recurrenceGroupId = null;
+    if (recentSimilarCount + 1 >= RECURRENCE_LINK_THRESHOLD) {
+      const existingGroupResult = await client.query(
+        `SELECT recurrence_group_id FROM complaints
+         WHERE category_id = $1 AND recurrence_group_id IS NOT NULL
+           AND created_at >= now() - interval '14 days'
+         LIMIT 1`,
+        [category_id]
+      );
+      recurrenceGroupId =
+        existingGroupResult.rows[0]?.recurrence_group_id || crypto.randomUUID();
+
+      // Backfill the group onto any recent unlinked similar complaints too
+      await client.query(
+        `UPDATE complaints SET recurrence_group_id = $1
+         WHERE category_id = $2 AND recurrence_group_id IS NULL
+           AND created_at >= now() - interval '14 days'`,
+        [recurrenceGroupId, category_id]
+      );
+    }
+
     const complaintResult = await client.query(
-      `INSERT INTO complaints (resident_id, category_id, description, photo_url, priority_score, priority_label, initial_severity_score)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO complaints (resident_id, category_id, description, photo_url, priority_score, priority_label, initial_severity_score, recurrence_group_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING *`,
-      [residentId, category_id, description, photoUrl, score, label, initialSeverityScore]
+      [residentId, category_id, description, photoUrl, score, label, initialSeverityScore, recurrenceGroupId]
     );
 
     const complaint = complaintResult.rows[0];
@@ -237,5 +265,232 @@ export async function getComplaintById(req, res) {
   } catch (err) {
     console.error("Get complaint by id error:", err.message);
     res.status(500).json({ error: "Something went wrong" });
+  }
+}
+
+// PATCH /api/complaints/:id/status
+// Admin changes a complaint's status. Every change writes a new
+// complaint_history row rather than just overwriting complaints.status,
+// so the full lifecycle is always reconstructable.
+//
+// Moving to "Resolved" requires a resolution photo as proof of work —
+// enforced here, not just suggested in the frontend.
+export async function updateComplaintStatus(req, res) {
+  const { id } = req.params;
+  const { new_status, note } = req.body;
+  const adminId = req.user.id;
+
+  const validStatuses = ["Open", "In Progress", "Resolved"];
+  if (!validStatuses.includes(new_status)) {
+    return res.status(400).json({ error: `new_status must be one of: ${validStatuses.join(", ")}` });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    const existingResult = await client.query("SELECT * FROM complaints WHERE id = $1", [id]);
+    if (existingResult.rows.length === 0) {
+      return res.status(404).json({ error: "Complaint not found" });
+    }
+    const existing = existingResult.rows[0];
+
+    // Resolving requires proof — a resolution photo — before/after style,
+    // so "Resolved" means something more than an admin's word for it.
+    let resolutionPhotoUrl = existing.resolution_photo_url;
+    if (new_status === "Resolved") {
+      if (!req.file) {
+        return res.status(400).json({ error: "A resolution photo is required to mark a complaint as Resolved" });
+      }
+      resolutionPhotoUrl = await uploadPhoto(req.file, "resolutions");
+    }
+
+    await client.query("BEGIN");
+
+    const updateResult = await client.query(
+      `UPDATE complaints
+       SET status = $1,
+           resolution_photo_url = $2,
+           resident_confirmed = CASE WHEN $1 = 'Resolved' THEN FALSE ELSE resident_confirmed END,
+           updated_at = now()
+       WHERE id = $3
+       RETURNING *`,
+      [new_status, resolutionPhotoUrl, id]
+    );
+
+    const updated = updateResult.rows[0];
+
+    await client.query(
+      `INSERT INTO complaint_history (complaint_id, actor_id, old_status, new_status, priority_score_at_time, note)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [id, adminId, existing.status, new_status, updated.priority_score, note || null]
+    );
+
+    await client.query("COMMIT");
+
+    // Notify the resident by email — failure here never breaks the request
+    const residentResult = await pool.query("SELECT name, email FROM users WHERE id = $1", [updated.resident_id]);
+    const resident = residentResult.rows[0];
+    if (resident) {
+      sendEmail(
+        resident.email,
+        `Your complaint status changed to ${new_status}`,
+        `Hi ${resident.name},\n\nYour complaint "${updated.description}" is now: ${new_status}.\n${note ? `Note from admin: ${note}` : ""}`
+      );
+    }
+
+    res.json({ complaint: updated });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Update status error:", err.message);
+    res.status(500).json({ error: "Something went wrong while updating status" });
+  } finally {
+    client.release();
+  }
+}
+
+// PATCH /api/complaints/:id/assign
+// Admin assigns a staff member (plumber, electrician, etc.) to a complaint.
+// Kept as a simple text field rather than its own login — logged to
+// history so the record of who was dispatched and when is preserved.
+export async function assignComplaint(req, res) {
+  const { id } = req.params;
+  const { assignee_name } = req.body;
+  const adminId = req.user.id;
+
+  if (!assignee_name) {
+    return res.status(400).json({ error: "assignee_name is required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    const existingResult = await client.query("SELECT * FROM complaints WHERE id = $1", [id]);
+    if (existingResult.rows.length === 0) {
+      return res.status(404).json({ error: "Complaint not found" });
+    }
+    const existing = existingResult.rows[0];
+
+    await client.query("BEGIN");
+
+    const updateResult = await client.query(
+      "UPDATE complaints SET assignee_name = $1, updated_at = now() WHERE id = $2 RETURNING *",
+      [assignee_name, id]
+    );
+
+    await client.query(
+      `INSERT INTO complaint_history (complaint_id, actor_id, old_status, new_status, priority_score_at_time, note)
+       VALUES ($1, $2, $3, $3, $4, $5)`,
+      [id, adminId, existing.status, existing.priority_score, `Assigned to ${assignee_name}`]
+    );
+
+    await client.query("COMMIT");
+    res.json({ complaint: updateResult.rows[0] });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Assign complaint error:", err.message);
+    res.status(500).json({ error: "Something went wrong" });
+  } finally {
+    client.release();
+  }
+}
+
+// POST /api/complaints/:id/confirm
+// Resident confirms a Resolved complaint is actually fixed. This is what
+// makes "Resolved" mean something more than "the admin says so" — the
+// person who raised the issue gets the final word before it's truly closed.
+export async function confirmResolution(req, res) {
+  const { id } = req.params;
+  const residentId = req.user.id;
+
+  const client = await pool.connect();
+
+  try {
+    const existingResult = await client.query("SELECT * FROM complaints WHERE id = $1", [id]);
+    if (existingResult.rows.length === 0) {
+      return res.status(404).json({ error: "Complaint not found" });
+    }
+    const existing = existingResult.rows[0];
+
+    if (existing.resident_id !== residentId) {
+      return res.status(403).json({ error: "You can only confirm your own complaints" });
+    }
+    if (existing.status !== "Resolved") {
+      return res.status(400).json({ error: "Only a Resolved complaint can be confirmed" });
+    }
+
+    await client.query("BEGIN");
+
+    await client.query(
+      `UPDATE complaints SET resident_confirmed = TRUE, updated_at = now() WHERE id = $1`,
+      [id]
+    );
+
+    await client.query(
+      `INSERT INTO complaint_history (complaint_id, actor_id, old_status, new_status, priority_score_at_time, note)
+       VALUES ($1, $2, 'Resolved', 'Resolved', $3, 'Resident confirmed the fix')`,
+      [id, residentId, existing.priority_score]
+    );
+
+    await client.query("COMMIT");
+
+    res.json({ message: "Complaint confirmed as resolved" });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Confirm resolution error:", err.message);
+    res.status(500).json({ error: "Something went wrong" });
+  } finally {
+    client.release();
+  }
+}
+
+// POST /api/complaints/:id/reopen
+// Resident disputes a Resolved complaint — it goes back to "Reopened"
+// (not a brand new complaint), preserving the full history instead of
+// starting over. Admin will see it back on their active board.
+export async function reopenComplaint(req, res) {
+  const { id } = req.params;
+  const { note } = req.body;
+  const residentId = req.user.id;
+
+  const client = await pool.connect();
+
+  try {
+    const existingResult = await client.query("SELECT * FROM complaints WHERE id = $1", [id]);
+    if (existingResult.rows.length === 0) {
+      return res.status(404).json({ error: "Complaint not found" });
+    }
+    const existing = existingResult.rows[0];
+
+    if (existing.resident_id !== residentId) {
+      return res.status(403).json({ error: "You can only reopen your own complaints" });
+    }
+    if (existing.status !== "Resolved") {
+      return res.status(400).json({ error: "Only a Resolved complaint can be reopened" });
+    }
+
+    await client.query("BEGIN");
+
+    const updateResult = await client.query(
+      `UPDATE complaints
+       SET status = 'Reopened', resident_confirmed = FALSE, updated_at = now()
+       WHERE id = $1
+       RETURNING *`,
+      [id]
+    );
+
+    await client.query(
+      `INSERT INTO complaint_history (complaint_id, actor_id, old_status, new_status, priority_score_at_time, note)
+       VALUES ($1, $2, 'Resolved', 'Reopened', $3, $4)`,
+      [id, residentId, existing.priority_score, note || "Resident reopened — issue not actually fixed"]
+    );
+
+    await client.query("COMMIT");
+
+    res.json({ complaint: updateResult.rows[0] });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Reopen complaint error:", err.message);
+    res.status(500).json({ error: "Something went wrong" });
+  } finally {
+    client.release();
   }
 }
