@@ -16,7 +16,7 @@ app.use(express.json());
 
 // Health check — deliberately queries the DB so an uptime pinger hitting
 // this route keeps the Supabase free-tier project from auto-pausing.
-app.get("/health", async (req, res) => {
+app.get("/", async (req, res) => {
   try {
     await pool.query("SELECT 1");
     res.json({ status: "ok", db: "connected", time: new Date().toISOString() });
